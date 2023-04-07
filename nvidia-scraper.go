@@ -2,132 +2,130 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
-	"strconv"
+	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
-	memoryTotal = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "nvidia_memory_total",
-			Help: "Total memory for each GPU",
-		},
-		[]string{"gpu"},
-	)
-	memoryFree = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "nvidia_memory_free",
-			Help: "Free memory for each GPU",
-		},
-		[]string{"gpu"},
-	)
-	memoryUsed = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "nvidia_memory_used",
-			Help: "Used memory for each GPU",
-		},
-		[]string{"gpu"},
-	)
-	utilizationGPU = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "nvidia_utilization_gpu",
-			Help: "GPU utilization for each GPU",
-		},
-		[]string{"gpu"},
-	)
-	utilizationMemory = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "nvidia_utilization_memory",
-			Help: "Memory utilization for each GPU",
-		},
-		[]string{"gpu"},
-	)
-	temperature = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "nvidia_temperature",
-			Help: "Temperature for each GPU",
-		},
-		[]string{"gpu"},
-	)
-	powerUsage = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "nvidia_power_usage",
-			Help: "Power usage for each GPU",
-		},
-		[]string{"gpu"},
-	)
+	gpuFreq = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nvidia_gpu_freq",
+		Help: "Current GPU frequency in MHz",
+	})
+
+	gpuUsage = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nvidia_gpu_usage",
+		Help: "Current GPU usage in percentage",
+	})
+
+	memUsed = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nvidia_mem_used",
+		Help: "Current memory usage in bytes",
+	})
+
+	memTotal = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nvidia_mem_total",
+		Help: "Total memory available in bytes",
+	})
+
+	powerDraw = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nvidia_power_draw",
+		Help: "Current power draw in Watts",
+	})
+
+	gpuTemp = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nvidia_gpu_temp",
+		Help: "Current GPU temperature in Celsius",
+	})
 )
 
 func main() {
 	// Initialize NVML
 	ret := nvml.Init()
 	if ret != nvml.SUCCESS {
-		fmt.Printf("error initializing NVML: %s\n", ret)
-		return
+		log.Fatal(ret)
 	}
 	defer nvml.Shutdown()
+
+	// Register Prometheus metrics
+	prometheus.MustRegister(gpuFreq)
+	prometheus.MustRegister(gpuUsage)
+	prometheus.MustRegister(memUsed)
+	prometheus.MustRegister(memTotal)
+	prometheus.MustRegister(powerDraw)
+	prometheus.MustRegister(gpuTemp)
 
 	// Get the number of GPUs
 	deviceCount, ret := nvml.DeviceGetCount()
 	if ret != nvml.SUCCESS {
-		fmt.Printf("error getting device count: %s\n", ret)
+		fmt.Println("Error getting device count:", ret)
 		return
 	}
 
-	// Iterate through the GPUs
-	for i := int(0); i < deviceCount; i++ {
-		// Get handle to GPU
-		handle, ret := nvml.DeviceGetHandleByIndex(i)
-		if ret != nvml.SUCCESS {
-			fmt.Printf("error getting device handle for GPU %d: %s\n", i, ret)
-			continue
-		}
+	// Scrape metrics every 5 seconds
 
-		// Get memory info
-		memoryInfo, ret := handle.GetMemoryInfo()
-		if ret != nvml.SUCCESS {
-			fmt.Printf("error getting memory info for GPU %d: %s\n", i, ret)
-		} else {
-			memoryTotal.WithLabelValues(strconv.Itoa(i)).Set(float64(memoryInfo.Total / 1024 / 1024))
-			memoryFree.WithLabelValues(strconv.Itoa(i)).Set(float64(memoryInfo.Free / 1024 / 1024))
-			memoryUsed.WithLabelValues(strconv.Itoa(i)).Set(float64(memoryInfo.Used / 1024 / 1024))
-		}
+	go func() {
+		for {
+			for i := int(0); i < deviceCount; i++ {
+				device, ret := nvml.DeviceGetHandleByIndex(i)
+				if ret != nvml.SUCCESS {
+					fmt.Println("Failed to get device:", i, ret)
+					continue
+				}
 
-		// Get utilization rates
-		utilization, ret := handle.GetUtilizationRates()
-		if ret != nvml.SUCCESS {
-			fmt.Printf("error getting utilization rates for GPU %d: %s\n", i, ret)
-		} else {
-			utilizationGPU.WithLabelValues(strconv.Itoa(i)).Set(float64(utilization.Gpu))
-			utilizationMemory.WithLabelValues(strconv.Itoa(i)).Set(float64(utilization.Memory))
-		}
+				// GPU frequency
+				var clockId nvml.ClockId
+				var clockType nvml.ClockType
+				freq, ret := device.GetClock(clockType, clockId)
+				if ret != nvml.SUCCESS {
+					fmt.Println("Failed to get GPU clock:", ret)
+				} else {
+					gpuFreq.Set(float64(freq))
+				}
 
-		// Get temperature
-		var tempSensors nvml.TemperatureSensors
-		temp, ret := handle.GetTemperature(tempSensors)
-		if ret != nvml.SUCCESS {
-			fmt.Printf("error getting temperature for GPU %d: %s\n", i, ret)
-		} else {
-			temperature.WithLabelValues(strconv.Itoa(i)).Set(float64(temp))
-		}
+				// GPU usage
+				util, ret := device.GetUtilizationRates()
+				if ret != nvml.SUCCESS {
+					fmt.Println("Failed to get GPU utilization:", ret)
+				} else {
+					gpuUsage.Set(float64(util.Gpu))
+				}
 
-		power, ret := handle.GetPowerUsage()
-		if ret != nvml.SUCCESS {
-			fmt.Printf("error getting power usage for GPU %d: %s\n", i, ret)
-		} else {
-			powerUsage.WithLabelValues(strconv.Itoa(i)).Set(float64(power))
+				// Memory usage
+				memInfo, ret := device.GetMemoryInfo()
+				if ret != nvml.SUCCESS {
+					fmt.Println("Failed to get memory info:", ret)
+				} else {
+					memUsed.Set(float64(memInfo.Used))
+					memTotal.Set(float64(memInfo.Total))
+				}
+
+				// Power draw
+				power, ret := device.GetPowerUsage()
+				if ret != nvml.SUCCESS {
+					fmt.Println("Failed to get power usage:", ret)
+				} else {
+					powerDraw.Set(float64(power) / 1000.0)
+				}
+
+				// GPU temperature
+				var tempSensors nvml.TemperatureSensors
+				temp, ret := device.GetTemperature(tempSensors)
+				if ret != nvml.SUCCESS {
+					fmt.Println("Failed to get GPU temperature:", ret)
+				} else {
+					gpuTemp.Set(float64(temp))
+				}
+			}
+			time.Sleep(5 * time.Second)
 		}
-	}
-	// Create HTTP handler for Prometheus metrics
+	}()
+
+	// Expose the Prometheus metrics
 	http.Handle("/metrics", promhttp.Handler())
-
-	// Start HTTP server
-	fmt.Println("Starting server at :8080")
-	http.ListenAndServe(":8080", nil)
-
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
